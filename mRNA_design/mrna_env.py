@@ -5,7 +5,6 @@ from gfn.env import Env, DiscreteEnv
 from typing import List, Dict
 import torch 
 
-
 AMINO_ACIDS: List[str] = [
     "A",  # Alanine
     "C",  # Cysteine
@@ -30,7 +29,6 @@ AMINO_ACIDS: List[str] = [
 ]
 
 STOP_CODONS: List[str] = ["UAA", "UAG", "UGA"]
-
 CODON_TABLE : Dict[str, List[str]] = {
     'A': ['GCU', 'GCC', 'GCA', 'GCG'],
     'C': ['UGU', 'UGC'],
@@ -65,12 +63,14 @@ AMBIGUOUS_AMINOACID_MAP: Dict[str, list[str]] = {
     "O": ["K"],  # Pyrrolysine (typically replaced with Lysine)
 }
 
-
 AA_LIST = list(CODON_TABLE.keys())
 AMBIG_AA_LIST = list(AMBIGUOUS_AMINOACID_MAP.keys())
-
 CODON_MAP = {codon: i for i, codon in enumerate(sorted(set(c for codons in CODON_TABLE.values() for c in codons)))}
-IDX_TO_CODON = {v: k for k, v in CODON_MAP.items()}
+
+# Flatten and index all codons
+ALL_CODONS = sorted({codon for codons in CODON_TABLE.values() for codon in codons})
+CODON_TO_IDX = {codon: idx for idx, codon in enumerate(ALL_CODONS)}
+IDX_TO_CODON = {idx: codon for codon, idx in CODON_TO_IDX.items()}
 
 def protein_to_tensor(protein):
 
@@ -85,6 +85,12 @@ def protein_to_tensor(protein):
 
     return torch.tensor(amino_acid_counts, dtype=torch.float)
 
+def get_synonymous_indices(amino_acid: str) -> List[int]:
+    """
+    Return the list of global codon indices that encode the given amino acid.
+    """
+    codons = CODON_TABLE.get(amino_acid, [])
+    return [CODON_TO_IDX[c] for c in codons]
 
 def get_synonymous_codons(amino_acid):
 
@@ -96,46 +102,103 @@ def get_synonymous_codons(amino_acid):
         syn = CODON_TABLE[aa]
     return syn
 
-
-
+def compute_gc_content_from_indices(indices: torch.LongTensor) -> torch.FloatTensor:
+    """
+    Given a tensor of codon indices (batch x seq_len), compute GC-content (%) per sequence.
+    """
+    # Expand to list of strings
+    contents = []
+    for seq in indices:
+        rna = ''.join(IDX_TO_CODON[int(i)] for i in seq) # mRNA sequence
+        gc = (rna.count('G') + rna.count('C')) / len(rna) * 100 if len(rna) > 0 else 0.0
+        contents.append(gc)
+    return torch.tensor(contents, dtype=torch.float, device=indices.device)
 
 class CodonDesignEnv(DiscreteEnv):
+    """
+    Environment for designing mRNA codon sequences for a given protein. States are LongTensors of shape (batch, t) representing chosen codon indices.
+    Action space is global codon set of size len(ALL_CODONS); dynamic masks restrict to synonymous codons at each step.
+    Rewards are GC-content of the full sequence so far.
+    """
 
-    def __init__(self, protein_seq, dummy_action=None, exit_action=None, sf=None):
+    def __init__(
+        self,
+        protein_seq: str,
+        dummy_action=None, exit_action=None, sf=None
+    ):
+        self.protein_seq = protein_seq
+        self.seq_length = len(protein_seq)
+        self.n_actions = len(ALL_CODONS)
+        self.device = torch.device('cpu')
+
+        # Precompute valid indices per position
+        self.syn_indices = [get_synonymous_indices(aa) for aa in protein_seq]
+
+        # Initial empty state
+        initial_state = torch.empty((0,), dtype=torch.long, device=self.device)
+
+        super().__init__(
+            n_actions=self.n_actions,
+            s0=initial_state,  
+            state_shape=(None,),    # variable-length vector of codon indices
+            action_shape=(),                  
+            dummy_action=dummy_action,
+            exit_action=exit_action,
+            sf=sf
+        )
+ 
+    def step(
+        self,
+        states: torch.LongTensor,
+        actions: torch.LongTensor,
+    ) -> torch.LongTensor:
+        # Append action indices to states
+        # states: (batch, t), actions: (batch,)
+        actions = actions.unsqueeze(-1)
+        return torch.cat([states, actions], dim=1)
+    
+    def backward_step(
+        self,
+        states: torch.LongTensor,
+    ) -> torch.LongTensor:
+        # Remove last codon index
+        return states[:, :-1]
+    
+    def update_masks(
+        self,
+        states: torch.LongTensor,
+    ) -> torch.BoolTensor:
         
-        self.protein = protein_seq
-        self.seq_length = len(self.protein)
+        # For each sequence in batch, mask only synonymous codons for next aa.
+        batch = states.shape[0]
+        next_pos = states.shape[1]
 
-        self.codon_choices = [get_synonymous_codons(aa) for aa in protein_seq]
-        self.action_space_sizes = [len(choices) for choices in self.codon_choices]
+        if next_pos >= self.seq_length:
+            # No valid actions beyond terminal
+            return torch.zeros((batch, self.n_actions), dtype=torch.bool, device=self.device)
+        
+        valid = torch.zeros((batch, self.n_actions), dtype=torch.bool, device=self.device)
+        valid_indices = self.syn_indices[next_pos]
+        valid[:, valid_indices] = True
+        return valid
 
-        n_actions = 64 # Total number of codons in the codon table
-
-        device = torch.device("cpu")
-
-        s0 = torch.zeros(0, dtype=torch.float, device=device) # Start with an empty sequence
-        self.state_shape = (self.seq_length,)  # Number of amino acids <=> Codons
-
-        super().__init__(n_actions, 
-                         s0, 
-                         state_shape=self.state_shape, 
-                         action_shape=(1,),  # Each action is 1 codon,
-                         dummy_action= dummy_action,
-                         exit_action=exit_action, 
-                         sf=sf)
-
-
-    def step(self, state, action): 
-
-        # state is the mRNA sequence, action is the chosen codon
-        # Append the chosen codon to the mRNA sequence
-        return torch.cat([state, action.unsqueeze(-1)], dim=-1)
+    def reward(
+        self,
+        states: torch.LongTensor,
+    ) -> torch.FloatTensor:
+        # Compute GC-content percentage of each sequence
+        return compute_gc_content_from_indices(states)
     
-    def reset(self, batch_size):
-        return ["" for _ in range(batch_size)]  # initial empty sequences
+    def reset(self, batch_size: int) -> torch.LongTensor:
+        # Return batch of empty sequences
+        return torch.empty((batch_size, 0), dtype=torch.long, device=self.device)
     
-    def is_terminal(self, states):
-        return [len(s) // 3 >= len(self.protein) for s in states]
+    def is_terminal(
+        self,
+        states: torch.LongTensor,
+    ) -> torch.BoolTensor:
+        # Terminal when sequence length equals protein length
+        return states.shape[1] >= self.seq_length
 
 
 
@@ -156,36 +219,3 @@ class CodonDesignEnv(DiscreteEnv):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class CodonDesignEnv(Env):
-    def __init__(self, protein_seq, codon_table):
-        self.protein = protein_seq
-        self.codon_choices = [get_synonymous_codons(aa) for aa in protein_seq]
-        self.num_steps = len(protein_seq)
-
-    def reset(self, batch_size):
-        return ["" for _ in range(batch_size)]  # initial empty sequences
-
-    def step(self, states, actions):
-        # Append the chosen codon to each sequence
-        new_states = []
-        for s, a in zip(states, actions):
-            codon = self.codon_choices[len(s) // 3][a]  # a is index into allowed codons
-            new_states.append(s + codon)
-        return new_states
-
-    def is_terminal(self, states):
-        return [len(s) // 3 >= len(self.protein) for s in states]
